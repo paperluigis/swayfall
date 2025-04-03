@@ -36,9 +36,12 @@ SQRT_1_2 = m.sqrt(2) / 2
 
 
 # enable printing various state (e.g. body coordinates)
-STATUS = False
+STATUS = True
 
-# enable panning and volume control via pipewire
+# enable panning and volume control for windows via pipewire
+# only works when the process that opened the window is also the process that is playing audio
+# (that is, it won't work with mpv running in a terminal emulator, or with modern web browsers)
+# it also only works with _stereo_ sink inputs -- that is, the media player has to output two channels
 PIPEWIRE = True
 
 # how often shall the code run the cursed shell string above to get pipewire node IDs?
@@ -50,7 +53,7 @@ PIPEWIRE_UPDATE_INTERVAL = 0.1
 GRAV = 0
 
 # arena-wide acceleration value
-FLAT_GRAVITY = (0, -1)
+FLAT_GRAVITY = (0, -2)
 
 # how bouncy things are
 RESTITUTION=.75
@@ -58,6 +61,13 @@ RESTITUTION=.75
 FPS=30
 # we only handle one output for now
 OUTPUT_NAME="eDP-1"
+
+# shall the script only handle one workspace? (set to None to handle all workspaces)
+WORKSPACE="9"
+# shall the script only update the workspace when it's focused?
+# (in contrast of it being merely visible, e.g. in multi-monitor setups)
+ONLY_WHEN_FOCUSED=True
+
 # box2d coordinate scale
 BOX2D_SCALE=1/128
 
@@ -99,11 +109,13 @@ arena = b2.world(gravity=FLAT_GRAVITY, contactListener=cl3)
 
 a_walls = None
 arena_size = None
+arena_offset = None
 
 # floating_con id -> { body: b2Body, width: int, height: int, x: int, y: int }
 windows = {}
 
 tree = None
+workspaces = None
 curr_workspace = None
 
 pw_nodes_per_pid = {}
@@ -112,14 +124,17 @@ a = i3ipc.Connection()
 
 print()
 
-def resize_arena(w, h):
-	global arena_size, a_walls
-	if arena_size == (w, h): return
+def resize_arena(w, h, x=0, y=0):
+	global arena_size, arena_offset, a_walls
+	if arena_size == (w, h) and arena_offset == (x, y): return
 	arena_size = (w, h)
+	arena_offset = (x, y)
+
 	if a_walls != None:
-		a_walls.destroy()
+		arena.DestroyBody(a_walls)
 		a_walls = None
 	a_walls = arena.CreateStaticBody(
+		position=(x*BOX2D_SCALE, -y*BOX2D_SCALE),
 		shapes=[
 			# left wall
 			b2.edgeShape(vertices=[(0, 0), (0, ARENA_HEIGHT)]),
@@ -154,6 +169,7 @@ def create_body(container_id, initial=None):
 		type = b2.dynamicBody,
 		awake = True,
 		linearDamping = 0,
+		fixedRotation = True,
 		fixtures=b2.fixtureDef(
 			shape=b2.polygonShape(box=(width/2*BOX2D_SCALE, height/2*BOX2D_SCALE)),
 			restitution=RESTITUTION,
@@ -162,7 +178,7 @@ def create_body(container_id, initial=None):
 
 	if initial:
 		bd.position=(randrange(0, arena_size[0]-width)*BOX2D_SCALE, (arena_size[1]+height+100)*BOX2D_SCALE)
-		bd.linearVelocity=(randrange(-20, 20), -5)
+		bd.linearVelocity=(randrange(-8, 8), -5)
 	else:
 		bd.position=((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
 		bd.linearVelocity=(0, 0)
@@ -187,6 +203,8 @@ def sync_body(container_id):
 
 	if width == b["width"] and height == b["height"] and x == b["x"] and y == b["y"]:
 		return # yeah nothing to do here
+	if con.fullscreen_mode != 0:
+		return # we are not dealing with fullscreen windows
 
 	arena.DestroyBody(b["body"])
 
@@ -194,6 +212,7 @@ def sync_body(container_id):
 		type = b2.dynamicBody,
 		awake = True,
 		linearDamping = 0,
+		fixedRotation = True,
 		fixtures=b2.fixtureDef(
 			shape=b2.polygonShape(box=(width/2*BOX2D_SCALE, height/2*BOX2D_SCALE)),
 			restitution=RESTITUTION,
@@ -262,15 +281,44 @@ if PIPEWIRE:
 	threading.Thread(target=pw_fetch_nodes_loop, daemon=True).start()
 	threading.Thread(target=pw_update_volumes_loop, daemon=True).start()
 
+t = monotonic()
 while True:
-	#print(d)
-	tree = a.get_tree()
+	sleep(max(0, (1/FPS) - t % (1/FPS)))
 
-	for la in tree.nodes:
-		if la.name == OUTPUT_NAME:
-			resize_arena(la.rect.width, la.rect.height)
-			curr_workspace = la.find_by_id(la.focus[0]) # .current_workspace doesn't exist in this library??
+	pt = t
+	t = monotonic()
+	d = min(1, max(1/FPS, t - pt))
+
+	#print(d)
+	workspaces = a.get_workspaces()
+
+	curr_workspace = None
+
+	for wa in workspaces:
+		#print(wa.ipc_data["id"], wa.name, wa.output, wa.rect.x, wa.rect.y, wa.rect.width, wa.rect.height)
+		resize_arena(wa.rect.width, wa.rect.height, wa.rect.x, wa.rect.y)
+		if wa.output == OUTPUT_NAME and wa.visible \
+			and (not WORKSPACE or wa.name == WORKSPACE):
+			tree = a.get_tree()
+			curr_workspace = tree.find_by_id(wa.ipc_data["id"])
+			if ONLY_WHEN_FOCUSED and not curr_workspace.find_focused():
+				curr_workspace = None
 			break
+
+	if curr_workspace == None:
+		continue
+
+
+	#for la in tree.nodes:
+	#	if la.name == OUTPUT_NAME:
+	#		resize_arena(la.rect.width, la.rect.height)
+	#		if WORKSPACE:
+	#			for lb in la.nodes:
+	#				if la.name == WORKSPACE:
+	#					curr_workspace = 
+	#		else:
+	#			curr_workspace = la.find_by_id(la.focus[0]) # .current_workspace doesn't exist in this library??
+	#		break
 
 	yeeted = dict(windows)
 	for c in curr_workspace.floating_nodes:
@@ -295,8 +343,8 @@ while True:
 		a.command(f"[con_id=\"{k}\"] move to workspace \"{curr_workspace.name}\"")
 
 		if not (
-			xt > -i["width"]  and xt < arena_size[0] and
-			yt > i["height"] - ARENA_HEIGHT/BOX2D_SCALE and yt < arena_size[1]):
+			xt - arena_offset[0] > -i["width"]  and xt < arena_size[0] and
+			yt - arena_offset[1]> i["height"] - ARENA_HEIGHT/BOX2D_SCALE and yt < arena_size[1]):
 			if OOB_BEHAVIOUR == DuckOOBBehaviour.CLOSE:
 				a.command(f"[con_id=\"{k}\"] kill")
 				killed.append(k)
@@ -315,10 +363,6 @@ while True:
 	#for i in killed:
 	#	destroy_body(i)
 
-	for i in windows.values():
-		# box2d may or may not rotate the bodies; sway (sadly) does not support rotation so we do this
-		i["body"].angle = 0
-
 	#if len(windows) > 0:
 	#	b = next(iter(windows.values()))["body"]
 	#	b.position = (arena_size[0]/2*BOX2D_SCALE, arena_size[1]/2*BOX2D_SCALE)
@@ -331,7 +375,6 @@ while True:
 		for k, i in windows.items():
 			b = i["body"]
 			e = b.position
-			an = b.angle
 			ms = b.mass
 			print(f"{k:> 4} | "
 				f"{e.x:> 9.02f} {e.y:> 9.02f} | {i['x']:> 5} {i['y']:> 5} | {ms: 5.03f}"
@@ -341,7 +384,6 @@ while True:
 		for i0, i1, e in cl3.collisions:
 			print(f"{i0:>4}, {i1:>4} imp={e}\x1b[K")
 
-		print(f"arena_height={ARENA_HEIGHT/BOX2D_SCALE}\x1b[K")
 		print("\x1b[K", flush=True)
 
 
@@ -371,11 +413,6 @@ while True:
 
 	cl3.collisions.clear()
 	arena.Step(d, 10, 10)
-
-	pt = t
-	t = monotonic()
-	d = t - pt
-	sleep(max(0, (1/FPS) - t % (1/FPS)))
 
 #bo = [arena.CreateDynamicBody(
 #	position=(randrange(BOX_SIZE[0]/2*BOX2D_SCALE, (ARENA_SIZE[0]-BOX_SIZE[0]/2)*BOX2D_SCALE), (ARENA_SIZE[1] + 300 + i*2*BOX_SIZE[1]) * BOX2D_SCALE),

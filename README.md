@@ -5,6 +5,8 @@ inspired by [another python program of a similar name](https://github.com/Failed
 
 it works on sway 1.10, not sure about its compatibility with i3.
 
+the script is supposed to be run with pypy but cpython should work too
+
 ## running the thing
 ```console
 $ # assuming that we're in a python3 venv
