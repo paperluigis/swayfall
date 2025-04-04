@@ -10,6 +10,7 @@ from random import random
 
 import subprocess
 
+import atexit
 import math as m
 import json
 
@@ -57,6 +58,7 @@ FLAT_GRAVITY = (0, -2)
 
 # how bouncy things are
 RESTITUTION=.75
+
 # value for the limiter, if your pc is fast enough this will be the box2d timestep
 FPS=30
 # we only handle one output for now
@@ -154,6 +156,7 @@ def create_body(container_id, initial=None):
 	height = con.rect.height
 	x = con.rect.x
 	y = con.rect.y
+	body_type = b2.staticBody if con.sticky else b2.dynamicBody
 
 	if initial == None:
 		initial = (x, y) == INITIAL_WINDOW_COORDS
@@ -166,7 +169,7 @@ def create_body(container_id, initial=None):
 	}
 
 	bd = b2.bodyDef(
-		type = b2.dynamicBody,
+		type = body_type,
 		awake = True,
 		linearDamping = 0,
 		fixedRotation = True,
@@ -200,6 +203,9 @@ def sync_body(container_id):
 	height = con.rect.height
 	x = con.rect.x
 	y = con.rect.y
+	body_type = b2.staticBody if con.sticky else b2.dynamicBody
+
+	b["body"].type = body_type
 
 	if width == b["width"] and height == b["height"] and x == b["x"] and y == b["y"]:
 		return # yeah nothing to do here
@@ -209,7 +215,7 @@ def sync_body(container_id):
 	arena.DestroyBody(b["body"])
 
 	bd = b2.bodyDef(
-		type = b2.dynamicBody,
+		type = body_type,
 		awake = True,
 		linearDamping = 0,
 		fixedRotation = True,
@@ -224,7 +230,8 @@ def sync_body(container_id):
 
 	bd.mass = width * height * BOX2D_SCALE * BOX2D_SCALE
 	bd.position=((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
-	bd.linearVelocity=((x-b["x"])*DRAG_SCALE*BOX2D_SCALE, (b["y"]-y)*DRAG_SCALE*BOX2D_SCALE)
+	if body_type != b2.staticBody:
+		bd.linearVelocity=((x-b["x"])*DRAG_SCALE*BOX2D_SCALE, (b["y"]-y)*DRAG_SCALE*BOX2D_SCALE)
 
 	sh = randrange(m.pi * 2)
 	bo = arena.CreateBody(bd)
@@ -258,6 +265,9 @@ def pw_fetch_nodes_loop():
 
 def pw_update_volumes_loop():
 	spw = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+	@atexit.register
+	def on_exit():
+		spw.terminate()
 	while True:
 		for i in windows.values():
 			e = i["body"].position
@@ -301,7 +311,7 @@ while True:
 			and (not WORKSPACE or wa.name == WORKSPACE):
 			tree = a.get_tree()
 			curr_workspace = tree.find_by_id(wa.ipc_data["id"])
-			if ONLY_WHEN_FOCUSED and not curr_workspace.find_focused():
+			if ONLY_WHEN_FOCUSED and not curr_workspace.find_focused() and not curr_workspace.focused:
 				curr_workspace = None
 			break
 

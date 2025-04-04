@@ -12,4 +12,6 @@ the script is supposed to be run with pypy but cpython should work too
 $ # assuming that we're in a python3 venv
 $ pip install -r requirements.txt
 $ ./gravity.py
+$ # sometimes it fails to kill its subprocesses on exit
+$ killall pw-cli
 ```
