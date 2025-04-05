@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# depends on i3ipc==2.2.1 and Box2D==2.3.2
+# depends on i3ipc==2.2.1, Box2D==2.3.2 and optionally pygame
 # also depends on the pw-dump command and jq (1.7.1)
 
 import os
@@ -14,6 +14,8 @@ import atexit
 import math as m
 import json
 
+from weakref import WeakKeyDictionary
+from types import SimpleNamespace
 from enum import Enum
 
 import i3ipc
@@ -35,9 +37,33 @@ pw-dump | jq -c '
 """
 SQRT_1_2 = m.sqrt(2) / 2
 
+# enable debug window
+DEBUG_DISP = True
+DEBUG_DISP_FPS = 60
+# debug pixels per box2d unit
+DEBUG_DISP_SCALE = 20
+# how many units of space behind the walls to draw, in box2d coords
+DEBUG_DISP_BORDER = 2
+
+# make the debug view as tall as...
+class DuckDebugDispHeightMode(Enum):
+	# ...the named variables
+	ARENA_HEIGHT = 1
+	ARENA_DISCARD_HEIGHT = 2
+	# ...the workspace height
+	ARENA_SIZE = 3
+
+DEBUG_DISP_HEIGHT_MODE = DuckDebugDispHeightMode.ARENA_SIZE
+
+DEBUG_COLORS = {
+	"background":   (0x2e, 0x27, 0x27, 0xff),
+	"body_fill":    (0x3d, 0x36, 0x36, 0xff),
+	"body_static":  (0x90, 0x69, 0x69, 0xff),
+	"body_dynamic": (0xd2, 0xa8, 0xa7, 0xff),
+}
 
 # enable printing various state (e.g. body coordinates)
-STATUS = True
+STATUS = False
 
 # enable panning and volume control for windows via pipewire
 # only works when the process that opened the window is also the process that is playing audio
@@ -48,7 +74,7 @@ PIPEWIRE = True
 # how often shall the code run the cursed shell string above to get pipewire node IDs?
 PIPEWIRE_FETCH_INTERVAL = 1
 # how often shall the code update the pipewire volumes?
-PIPEWIRE_UPDATE_INTERVAL = 0.1
+PIPEWIRE_UPDATE_INTERVAL = 0.05
 
 # gravitational constant (set to 0 to disable newtonian gravity)
 GRAV = 0
@@ -124,7 +150,25 @@ pw_nodes_per_pid = {}
 
 a = i3ipc.Connection()
 
-print()
+
+def check_body_oob(container_id):
+	a = windows[container_id]
+	e = a["body"].position
+
+	hw = a["width"] * BOX2D_SCALE / 2
+	hh = a["height"] * BOX2D_SCALE / 2
+
+	left = e.x - hw
+	right = e.x + hw
+	top = e.y + hh
+	bottom = e.y - hh
+
+	if a["body"].type == b2.staticBody:
+		return False
+
+	return not (
+		right > -1 and left < (arena_size[0]*BOX2D_SCALE) + 1 and \
+		top > -1 and bottom < ARENA_HEIGHT + 1 )
 
 def resize_arena(w, h, x=0, y=0):
 	global arena_size, arena_offset, a_walls
@@ -153,9 +197,10 @@ def create_body(container_id, initial=None):
 	assert con != None, f"no container with id {container_id}"
 
 	width = con.rect.width
-	height = con.rect.height
+	height = con.rect.height + con.deco_rect.height
 	x = con.rect.x
-	y = con.rect.y
+	y = con.rect.y - con.deco_rect.height
+
 	body_type = b2.staticBody if con.sticky else b2.dynamicBody
 
 	if initial == None:
@@ -174,21 +219,29 @@ def create_body(container_id, initial=None):
 		linearDamping = 0,
 		fixedRotation = True,
 		fixtures=b2.fixtureDef(
-			shape=b2.polygonShape(box=(width/2*BOX2D_SCALE, height/2*BOX2D_SCALE)),
+			shape=b2.polygonShape(
+				vertices = [
+					(0, 0),
+					(width*BOX2D_SCALE, 0),
+					(width*BOX2D_SCALE, -height*BOX2D_SCALE),
+					(0, -height*BOX2D_SCALE)]),
 			restitution=RESTITUTION,
-			density=8),
+			density=1),
 		userData = data)
 
 	if initial:
 		bd.position=(randrange(0, arena_size[0]-width)*BOX2D_SCALE, (arena_size[1]+height+100)*BOX2D_SCALE)
 		bd.linearVelocity=(randrange(-8, 8), -5)
 	else:
-		bd.position=((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
+		#bd.position=((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
+		bd.position=(x*BOX2D_SCALE, (arena_size[1] - y) * BOX2D_SCALE)
 		bd.linearVelocity=(0, 0)
 
 	bo = arena.CreateBody(bd)
 
 	#bo.mass = width * height * BOX2D_SCALE * BOX2D_SCALE,
+
+	data["volume"] = width * height * BOX2D_SCALE * BOX2D_SCALE
 
 	data["body"] = bo
 	windows[container_id] = data
@@ -200,17 +253,28 @@ def sync_body(container_id):
 	b = windows[container_id]
 
 	width = con.rect.width
-	height = con.rect.height
+	height = con.rect.height + con.deco_rect.height
 	x = con.rect.x
-	y = con.rect.y
+	y = con.rect.y - con.deco_rect.height
+
 	body_type = b2.staticBody if con.sticky else b2.dynamicBody
 
 	b["body"].type = body_type
 
-	if width == b["width"] and height == b["height"] and x == b["x"] and y == b["y"]:
+
+	#bpos = ((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
+	bpos = (x * BOX2D_SCALE, (arena_size[1] - y) * BOX2D_SCALE)
+	lvel = (0, 0) if body_type == b2.staticBody else \
+		((x-b["x"])*DRAG_SCALE*BOX2D_SCALE, (b["y"]-y)*DRAG_SCALE*BOX2D_SCALE)
+
+	#print(lvel, x, b["x"], y, b["y"])
+
+	if x != b["x"] or y != b["y"]:
+		b["body"].transform = (bpos, 0)
+		b["body"].linearVelocity = lvel
+
+	if width == b["width"] and height == b["height"]:
 		return # yeah nothing to do here
-	if con.fullscreen_mode != 0:
-		return # we are not dealing with fullscreen windows
 
 	arena.DestroyBody(b["body"])
 
@@ -219,19 +283,22 @@ def sync_body(container_id):
 		awake = True,
 		linearDamping = 0,
 		fixedRotation = True,
+		position = bpos,
+		linearVelocity = lvel,
 		fixtures=b2.fixtureDef(
-			shape=b2.polygonShape(box=(width/2*BOX2D_SCALE, height/2*BOX2D_SCALE)),
+			shape=b2.polygonShape(
+				vertices = [
+					(0, 0),
+					(width*BOX2D_SCALE, 0),
+					(width*BOX2D_SCALE, -height*BOX2D_SCALE),
+					(0, -height*BOX2D_SCALE)]),
 			restitution=RESTITUTION,
-			density=8),
+			density=1),
 		userData = b)
 
-	if "b2_static" in con.marks:
-		bd.type = b2.staticBody
+	#bd.mass = width * height * BOX2D_SCALE * BOX2D_SCALE
+	b["volume"] = width * height * BOX2D_SCALE * BOX2D_SCALE
 
-	bd.mass = width * height * BOX2D_SCALE * BOX2D_SCALE
-	bd.position=((x + width/2) * BOX2D_SCALE, (arena_size[1] - y - height/2) * BOX2D_SCALE)
-	if body_type != b2.staticBody:
-		bd.linearVelocity=((x-b["x"])*DRAG_SCALE*BOX2D_SCALE, (b["y"]-y)*DRAG_SCALE*BOX2D_SCALE)
 
 	sh = randrange(m.pi * 2)
 	bo = arena.CreateBody(bd)
@@ -247,7 +314,9 @@ def sync_body(container_id):
 
 def destroy_body(container_id):
 	arena.DestroyBody(windows[container_id]["body"])
-	windows.pop(container_id)
+	a = windows.pop(container_id)
+	if PIPEWIRE:
+		pw_removed_bodies.append(a)
 
 def randrange(min, max=0):
 	return min + random() * (max-min)
@@ -256,19 +325,100 @@ d = 1/FPS
 pt = 0
 t = 0
 
+def debug_pygame():
+	global running, arena
+
+	import pygame
+	import pygame.locals
+
+	pygame.init()
+
+	try:
+		clock = pygame.time.Clock()
+
+		mfont = pygame.font.SysFont(["Terminus", "monospace"], 10)
+
+		pygame.display.set_caption("duck debug render")
+
+		screen_size = (0, 0)
+
+		def to_screen(pos):
+			return b2.vec2(
+				(DEBUG_DISP_BORDER + pos[0]) * DEBUG_DISP_SCALE,
+				screen_size[1] - (DEBUG_DISP_BORDER + pos[1]) * DEBUG_DISP_SCALE
+			)
+
+		while running:
+			if DEBUG_DISP_HEIGHT_MODE == DuckDebugDispHeightMode.ARENA_HEIGHT:
+				adh = ARENA_HEIGHT
+			elif DEBUG_DISP_HEIGHT_MODE == DuckDebugDispHeightMode.ARENA_DISCARD_HEIGHT:
+				adh = min(ARENA_DISCARD_HEIGHT, ARENA_HEIGHT)
+			elif DEBUG_DISP_HEIGHT_MODE == DuckDebugDispHeightMode.ARENA_SIZE:
+				adh = arena_size[1] * BOX2D_SCALE
+			screen_size_n = (
+				int((arena_size[0] * BOX2D_SCALE + DEBUG_DISP_BORDER*2) * DEBUG_DISP_SCALE),
+				int((adh + DEBUG_DISP_BORDER*2) * DEBUG_DISP_SCALE)
+			)
+			if screen_size_n != screen_size:
+				print(screen_size_n)
+				screen_size = screen_size_n
+				screen = pygame.display.set_mode(screen_size, vsync=True)
+
+			for event in pygame.event.get():
+				if event.type == pygame.locals.QUIT:
+					running = False
+
+			screen.fill(DEBUG_COLORS["background"])
+
+
+			for body in arena.bodies:
+				is_static = body.type == b2.staticBody
+				color = DEBUG_COLORS["body_static" if is_static else "body_dynamic"]
+				t = body.transform # we don't take angle into consideration
+				for fixture in body.fixtures:
+					if fixture.shape.vertices:
+						verts = [to_screen(b2.vec2(p)+t.position) for p in fixture.shape.vertices]
+
+					if fixture.type == b2.shape.e_edge:
+						pygame.draw.lines(screen, color, False, verts)
+					elif fixture.type == b2.shape.e_polygon:
+						pygame.draw.polygon(screen, DEBUG_COLORS["body_fill"], verts)
+						pygame.draw.lines(screen, color, True, verts)
+
+				if isinstance(body.userData, dict):
+					a = body.userData.get("id")
+					if type(a) == int:
+						fsurface = mfont.render(f"#{a}", True, color)
+						screen.blit(fsurface, to_screen(t.position)+(2,2))
+
+			pygame.display.flip()
+			clock.tick(DEBUG_DISP_FPS)
+	finally:
+		pygame.quit()
+
 def pw_fetch_nodes_loop():
 	global pw_nodes_per_pid
-	while True:
+	while running:
+		sleep(PIPEWIRE_FETCH_INTERVAL)
+		if not curr_workspace: continue
 		pr = subprocess.run(["sh", "-c", SH_GET_PIPEWIRE_PID_MAPPING], text=True, stdout=subprocess.PIPE)
 		pw_nodes_per_pid = json.loads(pr.stdout)
-		sleep(PIPEWIRE_FETCH_INTERVAL)
 
+pw_removed_bodies = []
 def pw_update_volumes_loop():
 	spw = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
 	@atexit.register
 	def on_exit():
 		spw.terminate()
-	while True:
+	while running:
+		sleep(PIPEWIRE_UPDATE_INTERVAL)
+		# the main thread loop is not updating, so we shouldn't either
+		if not curr_workspace: continue
+		for i in pw_removed_bodies:
+			so = json.dumps({"Spa:Pod:Object:Param:Props:channelVolumes": [1, 1]})
+			for i in pw_nodes_per_pid.get(str(i["pid"])) or []:
+				spw.stdin.write(f"s {i} 2 {so}\n")
+		pw_removed_bodies.clear()
 		for i in windows.values():
 			e = i["body"].position
 			mo = e - b2.vec2(arena_size[0] * BOX2D_SCALE / 2, 0)
@@ -276,6 +426,9 @@ def pw_update_volumes_loop():
 			pan = mo.x / (arena_size[0] * BOX2D_SCALE) * m.pi * .5
 			al = mv*SQRT_1_2*(m.cos(pan)-m.sin(pan))
 			ar = mv*SQRT_1_2*(m.cos(pan)+m.sin(pan))
+
+			al = round(al*100)/100
+			ar = round(ar*100)/100
 			#print(f"{i['id']:> 4} {mv:> 8.03f} {pan:> 8.03f}\x1b[K")
 
 			if (al, ar) != i.get("pw_volumes"):
@@ -285,14 +438,19 @@ def pw_update_volumes_loop():
 					spw.stdin.write(f"s {i} 2 {so}\n")
 					#print(f"s {i} 2 {so}\x1b[K\n")
 		spw.stdin.flush()
-		sleep(PIPEWIRE_UPDATE_INTERVAL)
+
+
+running = True
 
 if PIPEWIRE:
 	threading.Thread(target=pw_fetch_nodes_loop, daemon=True).start()
 	threading.Thread(target=pw_update_volumes_loop, daemon=True).start()
 
+if DEBUG_DISP:
+	threading.Thread(target=debug_pygame, daemon=True).start()
+
 t = monotonic()
-while True:
+while running:
 	sleep(max(0, (1/FPS) - t % (1/FPS)))
 
 	pt = t
@@ -311,7 +469,9 @@ while True:
 			and (not WORKSPACE or wa.name == WORKSPACE):
 			tree = a.get_tree()
 			curr_workspace = tree.find_by_id(wa.ipc_data["id"])
-			if ONLY_WHEN_FOCUSED and not curr_workspace.find_focused() and not curr_workspace.focused:
+			if curr_workspace and curr_workspace.find_fullscreen():
+				curr_workspace = None
+			if curr_workspace and ONLY_WHEN_FOCUSED and not curr_workspace.find_focused() and not curr_workspace.focused:
 				curr_workspace = None
 			break
 
@@ -332,6 +492,7 @@ while True:
 
 	yeeted = dict(windows)
 	for c in curr_workspace.floating_nodes:
+		if c.fullscreen_mode != 0: continue
 		if c.id not in windows:
 			create_body(c.id)
 		else:
@@ -345,16 +506,17 @@ while True:
 	#print(windows)
 
 	killed = []
-	for k, i in windows.items():
+	for k, i in [*windows.items()]:
 		e = i["body"].position
-		xt = int((e.x / BOX2D_SCALE) - i["width"]/2)
-		yt = int(arena_size[1] - (e.y / BOX2D_SCALE) - i["height"]/2)
-		a.command(f"[con_id=\"{k}\"] move absolute position {xt} {yt}")
-		a.command(f"[con_id=\"{k}\"] move to workspace \"{curr_workspace.name}\"")
+		#xt = int((e.x / BOX2D_SCALE) - i["width"]/2)
+		#yt = int(arena_size[1] - (e.y / BOX2D_SCALE) - i["height"]/2)
+		xt = int(e.x / BOX2D_SCALE)
+		yt = int(arena_size[1] - (e.y / BOX2D_SCALE))
+		if i["body"].type != b2.staticBody:
+			a.command(f"[con_id=\"{k}\"] move absolute position {xt} {yt}")
+			a.command(f"[con_id=\"{k}\"] move to workspace \"{curr_workspace.name}\"")
 
-		if not (
-			xt - arena_offset[0] > -i["width"]  and xt < arena_size[0] and
-			yt - arena_offset[1]> i["height"] - ARENA_HEIGHT/BOX2D_SCALE and yt < arena_size[1]):
+		if check_body_oob(k):
 			if OOB_BEHAVIOUR == DuckOOBBehaviour.CLOSE:
 				a.command(f"[con_id=\"{k}\"] kill")
 				killed.append(k)
@@ -379,15 +541,16 @@ while True:
 	#	b.linearVelocity = (0, 0)
 	#	b.mass = 200
 
+
 	if STATUS:
 		print("\x1b[H", end="")
 
 		for k, i in windows.items():
 			b = i["body"]
 			e = b.position
-			ms = b.mass
+			ms = i["volume"]
 			print(f"{k:> 4} | "
-				f"{e.x:> 9.02f} {e.y:> 9.02f} | {i['x']:> 5} {i['y']:> 5} | {ms: 5.03f}"
+				f"{e.x:> 9.02f} {e.y:> 9.02f} | {i['x']:> 5} {i['y']:> 5} {i['width']:> 4} {i['height']:> 4} | {ms: 5.03f}"
 				+ "\x1b[K")
 		print("\x1b[K", flush=True)
 
@@ -404,15 +567,15 @@ while True:
 			dj = win_array[j]
 			bj = dj["body"]
 			pj = bj.worldCenter
-			mj = bj.mass
+			mj = dj["volume"]
 			for k in range(j+1, len(win_array)):
 				dk = win_array[k]
 				bk = dk["body"]
 				pk = bk.worldCenter
-				mk = bk.mass
+				mk = dk["volume"]
 
 				dl = (pj - pk)
-				r = (pj - pk).Normalize()
+				r = dl.Normalize()
 				if r != 0:
 					f = GRAV * mj * mk / (r*r)
 
