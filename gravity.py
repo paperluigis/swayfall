@@ -38,7 +38,7 @@ pw-dump | jq -c '
 SQRT_1_2 = m.sqrt(2) / 2
 
 # enable debug window
-DEBUG_DISP = True
+DEBUG_DISP = False
 DEBUG_DISP_FPS = 60
 # debug pixels per box2d unit
 DEBUG_DISP_SCALE = 20
@@ -420,7 +420,7 @@ def pw_update_volumes_loop():
 				spw.stdin.write(f"s {i} 2 {so}\n")
 		pw_removed_bodies.clear()
 		for i in windows.values():
-			e = i["body"].position
+			e = i["body"].position + (i["width"] / 2 * BOX2D_SCALE, -i["height"] * BOX2D_SCALE)
 			mo = e - b2.vec2(arena_size[0] * BOX2D_SCALE / 2, 0)
 			mv = 1 / max(1, mo.y / (arena_size[1] * BOX2D_SCALE)) ** 3
 			pan = mo.x / (arena_size[0] * BOX2D_SCALE) * m.pi * .5
